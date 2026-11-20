@@ -30,8 +30,8 @@ public final class LongRangeBlockBuilder extends AbstractBlockBuilder implements
         fromBuilder = null;
         toBuilder = null;
         try {
-            fromBuilder = new LongBlockBuilder(estimatedSize, blockFactory);
-            toBuilder = new LongBlockBuilder(estimatedSize, blockFactory);
+            fromBuilder = new LongBlockBuilder(estimatedSize, blockFactory, false);
+            toBuilder = new LongBlockBuilder(estimatedSize, blockFactory, false);
         } finally {
             if (toBuilder == null) {
                 Releasables.closeWhileHandlingException(fromBuilder);
@@ -113,6 +113,12 @@ public final class LongRangeBlockBuilder extends AbstractBlockBuilder implements
         // LongRangeBlockBuilder delegates to inner builders; the inherited cancelPositionEntry rolls back
         // only the outer valueCount and not the inner builders' state. Throw to make misuse obvious.
         throw new UnsupportedOperationException("cancelPositionEntry is not supported by LongRangeBlockBuilder");
+    }
+
+    @Override
+    public boolean reopenLastPositionEntry() {
+        // See cancelPositionEntry: the inherited implementation would leave the inner builders behind.
+        throw new UnsupportedOperationException("reopenLastPositionEntry is not supported by LongRangeBlockBuilder");
     }
 
     public LongRangeBlockBuilder appendLongRange(long from, long to) {

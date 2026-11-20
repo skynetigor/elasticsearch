@@ -16,6 +16,42 @@ To give you insight into what deprecated features you’re using, {{es}}:
 
 % ## Next version [elasticsearch-nextversion-deprecations]
 
+## 9.5.6 [elasticsearch-9.5.6-deprecations]
+
+Packaging:
+* Deprecate running with Java 21-24 [#163427](https://github.com/elastic/elasticsearch/pull/163427)
+
+## 9.4.9 [elasticsearch-9.4.9-deprecations]
+
+There are no deprecations associated with this release.
+
+## 9.5.5 [elasticsearch-9.5.5-deprecations]
+
+There are no deprecations associated with this release.
+
+## 9.4.8 [elasticsearch-9.4.8-deprecations]
+
+There are no deprecations associated with this release.
+
+## 9.4.7 [elasticsearch-9.4.7-deprecations]
+
+There are no deprecations associated with this release.
+
+## 9.5.4 [elasticsearch-9.5.4-deprecations]
+
+There are no deprecations associated with this release.
+
+## 9.5.3 [elasticsearch-9.5.3-deprecations]
+
+Monitoring:
+* Deprecate the legacy monitoring REST APIs [#152269](https://github.com/elastic/elasticsearch/pull/152269)
+
+
+
+## 9.4.6 [elasticsearch-9.4.6-deprecations]
+
+There are no deprecations associated with this release.
+
 ## 9.5.2 [elasticsearch-9.5.2-deprecations]
 
 There are no deprecations associated with this release.

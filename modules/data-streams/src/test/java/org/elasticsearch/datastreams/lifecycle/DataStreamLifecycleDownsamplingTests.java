@@ -159,6 +159,7 @@ public class DataStreamLifecycleDownsamplingTests extends DataStreamLifecycleSer
                     .settings(
                         Settings.builder()
                             .put(firstGenMetadata.getSettings())
+                            .put(IndexMetadata.INDEX_DOWNSAMPLE_SOURCE_NAME_KEY, firstGenIndexName)
                             .put(IndexMetadata.INDEX_DOWNSAMPLE_SOURCE_UUID.getKey(), firstGenIndex.getUUID())
                             .put(IndexMetadata.INDEX_DOWNSAMPLE_STATUS.getKey(), STARTED)
                     )
@@ -191,6 +192,7 @@ public class DataStreamLifecycleDownsamplingTests extends DataStreamLifecycleSer
                         Settings.builder()
                             .put(firstGenMetadata.getSettings())
                             .put(IndexMetadata.INDEX_DOWNSAMPLE_SOURCE_NAME_KEY, firstGenIndexName)
+                            .put(IndexMetadata.INDEX_DOWNSAMPLE_SOURCE_UUID_KEY, firstGenIndex.getUUID())
                             .put(IndexMetadata.INDEX_DOWNSAMPLE_ORIGIN_NAME_KEY, firstGenIndexName)
                             .put(IndexMetadata.INDEX_DOWNSAMPLE_STATUS.getKey(), SUCCESS)
                     )
@@ -285,7 +287,7 @@ public class DataStreamLifecycleDownsamplingTests extends DataStreamLifecycleSer
         dataStreamLifecycleService.maybeExecuteDownsampling(projectState, dataStream, List.of(firstGenIndex), 0);
 
         assertThat(clientSeenRequests.size(), is(0));
-        ErrorEntry error = dataStreamLifecycleService.getErrorStore().getError(projectId, firstGenIndexName);
+        ErrorEntry error = dataStreamLifecycleService.getErrorStore().getError(projectId, firstGenIndex);
         assertThat(error, notNullValue());
         assertThat(error.error(), containsString("resource_already_exists_exception"));
     }
@@ -527,6 +529,7 @@ public class DataStreamLifecycleDownsamplingTests extends DataStreamLifecycleSer
                 .settings(
                     Settings.builder()
                         .put(initialProject.index(backingIndex).getSettings())
+                        .put(IndexMetadata.INDEX_DOWNSAMPLE_SOURCE_NAME_KEY, backingIndex.getName())
                         .put(IndexMetadata.INDEX_DOWNSAMPLE_SOURCE_UUID.getKey(), backingIndex.getUUID())
                         .put(IndexMetadata.INDEX_DOWNSAMPLE_STATUS.getKey(), STARTED)
                 )
@@ -591,6 +594,7 @@ public class DataStreamLifecycleDownsamplingTests extends DataStreamLifecycleSer
                     Settings.builder()
                         .put(initialProject.index(backingIndex).getSettings())
                         .put(IndexMetadata.INDEX_DOWNSAMPLE_SOURCE_NAME_KEY, backingIndexName)
+                        .put(IndexMetadata.INDEX_DOWNSAMPLE_SOURCE_UUID_KEY, backingIndex.getUUID())
                         .put(IndexMetadata.INDEX_DOWNSAMPLE_ORIGIN_NAME_KEY, backingIndexName)
                         .put(IndexMetadata.INDEX_DOWNSAMPLE_STATUS.getKey(), SUCCESS)
                 )

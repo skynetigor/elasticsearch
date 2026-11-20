@@ -11,9 +11,26 @@ import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.lucene.BytesRefs;
 import org.elasticsearch.xpack.esql.core.expression.Attribute;
 import org.elasticsearch.xpack.esql.core.expression.Expression;
+import org.elasticsearch.xpack.esql.core.expression.ExternalMetadataAttribute;
+import org.elasticsearch.xpack.esql.core.expression.FieldAttribute;
 import org.elasticsearch.xpack.esql.core.expression.Literal;
+import org.elasticsearch.xpack.esql.core.expression.MetadataAttribute;
+import org.elasticsearch.xpack.esql.core.expression.NamedExpression;
+import org.elasticsearch.xpack.esql.core.expression.ReferenceAttribute;
 import org.elasticsearch.xpack.esql.core.expression.UnresolvedAttribute;
+import org.elasticsearch.xpack.esql.core.expression.predicate.regex.WildcardPattern;
+import org.elasticsearch.xpack.esql.core.type.DataType;
+import org.elasticsearch.xpack.esql.core.util.StringUtils;
+import org.elasticsearch.xpack.esql.datasources.pushdown.StringPrefixUtils;
+import org.elasticsearch.xpack.esql.expression.function.scalar.multivalue.MvGreater;
+import org.elasticsearch.xpack.esql.expression.function.scalar.multivalue.MvInRange;
+import org.elasticsearch.xpack.esql.expression.function.scalar.multivalue.MvLess;
+import org.elasticsearch.xpack.esql.expression.function.scalar.string.Contains;
+import org.elasticsearch.xpack.esql.expression.function.scalar.string.EndsWith;
+import org.elasticsearch.xpack.esql.expression.function.scalar.string.StartsWith;
+import org.elasticsearch.xpack.esql.expression.function.scalar.string.regex.WildcardLike;
 import org.elasticsearch.xpack.esql.expression.predicate.Predicates;
+import org.elasticsearch.xpack.esql.expression.predicate.Range;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.Equals;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.EsqlBinaryComparison;
 import org.elasticsearch.xpack.esql.expression.predicate.operator.comparison.GreaterThan;
@@ -26,20 +43,26 @@ import org.elasticsearch.xpack.esql.plan.logical.Filter;
 import org.elasticsearch.xpack.esql.plan.logical.LogicalPlan;
 import org.elasticsearch.xpack.esql.plan.logical.UnresolvedExternalRelation;
 
+import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.Predicate;
 
 /**
- * Walks an unresolved logical plan extracting simple filter predicates from {@link Filter} nodes
- * above {@link UnresolvedExternalRelation} nodes. These hints are used for partition pruning
- * during glob expansion and split discovery.
+ * Walks filter predicates into {@link PartitionFilterHint}s for partition pruning during glob
+ * expansion and split discovery.
  *
- * <p>Only extracts predicates with an {@link UnresolvedAttribute} on one side and a {@link Literal}
- * on the other. Supported operators: {@code =}, {@code !=}, {@code >}, {@code >=}, {@code <},
- * {@code <=}, {@code IN}.
+ * <p>{@link #extract} is the pre-analysis path: {@link UnresolvedAttribute} versus {@link Literal}
+ * on {@code =}, {@code !=}, {@code >}, {@code >=}, {@code <}, {@code <=}, {@code IN}, plus
+ * case-sensitive {@code LIKE} on a requested {@code _file.*} column, intersected across every
+ * occurrence of a path.
+ *
+ * <p>{@link #fromConjuncts} is the resolved scan-relist path. See that method for operators,
+ * column gating, and {@link LiteralNormalizer}.
  */
 public final class PartitionFilterHintExtractor {
 
@@ -52,7 +75,13 @@ public final class PartitionFilterHintExtractor {
         GREATER_THAN_OR_EQUAL,
         LESS_THAN,
         LESS_THAN_OR_EQUAL,
-        IN;
+        IN,
+        /**
+         * Case-sensitive {@code LIKE} on a listing value. The hint's single value is the
+         * wildcard pattern string; matching uses {@link WildcardPattern} so listing agrees
+         * with the row filter. Not a glob rewrite: a pattern is not a folder spelling.
+         */
+        LIKE;
 
         public boolean canRewriteGlob() {
             return this == EQUALS || this == IN;
@@ -75,11 +104,31 @@ public final class PartitionFilterHintExtractor {
         }
     }
 
+    /**
+     * Turns a bound {@link Literal} into the object stored on a hint.
+     */
+    @FunctionalInterface
+    public interface LiteralNormalizer {
+        Object apply(Literal literal);
+    }
+
+    /** BytesRef → String. DATETIME stays a Long of millis. */
+    public static final LiteralNormalizer LISTING = PartitionFilterHintExtractor::listingValue;
+
+    /**
+     * DATETIME {@link Number} → {@link Instant} of millis; DATE_NANOS {@link Number} →
+     * {@link Instant} of epoch-second plus nano-of-second. Other types match {@link #LISTING}.
+     */
+    public static final LiteralNormalizer TEMPORAL = PartitionFilterHintExtractor::temporalValue;
+
+    private static final long NANOS_PER_SECOND = 1_000_000_000L;
+
     public static Map<String, List<PartitionFilterHint>> extract(LogicalPlan unresolvedPlan) {
         Map<String, List<List<PartitionFilterHint>>> perOccurrence = new LinkedHashMap<>();
-        collectHints(unresolvedPlan, List.of(), perOccurrence);
+        collectHints(unresolvedPlan, perOccurrence);
 
-        // One listing serves every occurrence of a path, so a folder may be skipped only if EVERY occurrence excludes
+        // Hints are keyed by path while resolution is keyed by a spec, so one path's hints must hold for every
+        // spec over it: a folder may be skipped only if EVERY occurrence excludes
         // it. `FROM ds | FORK (WHERE year == 2025) (WHERE ...)` reaches the same relation twice; letting one branch's
         // hint narrow the shared listing would starve the other. An unguarded occurrence contributes no hints and so
         // vetoes the rewrite outright.
@@ -99,6 +148,68 @@ public final class PartitionFilterHintExtractor {
             }
         });
         return result;
+    }
+
+    /**
+     * The hints in a set of conjuncts already bound to one relation occurrence, for a caller that holds the
+     * filters rather than the plan they came from.
+     * <p>
+     * {@link #extract} exists for the phase before analysis, where one listing serves every occurrence of a path
+     * and hints must therefore be intersected across them. A caller discovering files for a single occurrence has
+     * no such constraint: the filters it holds are that occurrence's, and narrowing to them starves nobody.
+     * <p>
+     * This overload reads <em>resolved</em> columns ({@link FieldAttribute}, {@link ReferenceAttribute},
+     * {@link ExternalMetadataAttribute}) against literals. Unresolved names are ignored — {@link #extract} is the
+     * pre-analysis path. Comparison, {@code IN}, prefix predicates ({@code STARTS_WITH}, case-sensitive
+     * {@code LIKE 'lit*'} on a partition key), case-sensitive {@code LIKE} of any shape on a requested
+     * {@code _file.*} column, {@code MV_IN_RANGE}, {@code MV_GREATER}, {@code MV_LESS}, and {@code Range} emit hints
+     * only for requested {@code _file.*} columns or names in {@code partitionKeys}; a data column is not a listing
+     * key and must not join the listing cache identity. Prefix predicates on partition keys become a GTE/LT range.
+     * {@code _file.*} {@code LIKE} becomes {@link Operator#LIKE} and is applied during listing, before
+     * {@code max_discovered_files}. {@code MV_IN_RANGE} is always a closed GTE+LTE (inclusivity is not read).
+     * {@code MV_GREATER}/{@code MV_LESS} are GTE/LTE ({@code include_bound} is not read). {@code Range} keeps
+     * {@code includeLower}/{@code includeUpper} as written. Case-insensitive {@code LIKE}, {@code RLIKE},
+     * {@code NOT}, and {@code OR} emit nothing. After {@code ReplaceRegexMatch}, prefix/suffix/contains
+     * {@code LIKE} arrives as {@code STARTS_WITH}/{@code ENDS_WITH}/{@code CONTAINS}; those reconstruct
+     * the equivalent {@link Operator#LIKE} pattern on requested {@code _file.*}. Bounds use {@link #LISTING},
+     * which keeps no units, so a conjunct with a {@code date_nanos} constant emits nothing either.
+     */
+    public static List<PartitionFilterHint> fromConjuncts(
+        List<Expression> conjuncts,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys
+    ) {
+        List<Expression> listable = new ArrayList<>(conjuncts.size());
+        for (Expression conjunct : conjuncts) {
+            if (conjunct.anyMatch(e -> e instanceof Literal literal && hasListingUnits(literal) == false) == false) {
+                listable.add(conjunct);
+            }
+        }
+        return fromConjuncts(listable, requestedMetadata, partitionKeys, LISTING);
+    }
+
+    /**
+     * {@link #fromConjuncts(List, Set, Set)} with a bound {@link LiteralNormalizer}.
+     * {@link #LISTING} is listing-cache identity (DATETIME stays a Long).
+     * {@link #TEMPORAL} maps date Numbers to {@link Instant} so a spec cannot treat datetime millis as unix-seconds.
+     */
+    public static List<PartitionFilterHint> fromConjuncts(
+        List<Expression> conjuncts,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys,
+        LiteralNormalizer normalizer
+    ) {
+        List<PartitionFilterHint> hints = new ArrayList<>();
+        for (Expression conjunct : conjuncts) {
+            extractResolvedFromExpression(conjunct, hints, requestedMetadata, partitionKeys, normalizer);
+        }
+        dropSubsumedPrefixFileLikes(hints);
+        return hints;
+    }
+
+    /** Delegates to {@link #fromConjuncts(List, Set, Set)} with no partition keys. */
+    public static List<PartitionFilterHint> fromConjuncts(List<Expression> conjuncts, Set<String> requestedMetadata) {
+        return fromConjuncts(conjuncts, requestedMetadata, Set.of());
     }
 
     /**
@@ -122,21 +233,44 @@ public final class PartitionFilterHintExtractor {
      * and in particular keeps the hint in {@code WHERE year == 2025 | EVAL year = 9}, where the filter reads the
      * partition column and the {@code EVAL} only affects what comes after it.
      */
-    private static void collectHints(
-        LogicalPlan node,
-        List<Expression> guardingConjuncts,
-        Map<String, List<List<PartitionFilterHint>>> result
-    ) {
-        if (node instanceof UnresolvedExternalRelation rel) {
+    private static void collectHints(LogicalPlan plan, Map<String, List<List<PartitionFilterHint>>> result) {
+        forEachGuardedRelation(plan, node -> node instanceof UnresolvedExternalRelation, (node, guardingConjuncts) -> {
+            UnresolvedExternalRelation rel = (UnresolvedExternalRelation) node;
             String path = extractPath(rel);
             if (path != null) {
+                Set<String> requestedMetadata = requestedMetadataNames(rel);
                 List<PartitionFilterHint> hints = new ArrayList<>();
                 for (Expression conjunct : guardingConjuncts) {
-                    extractFromExpression(conjunct, hints);
+                    extractFromExpression(conjunct, hints, requestedMetadata);
                 }
                 // Registered even when empty: an occurrence with no usable hint must veto the rewrite, not be ignored.
                 result.computeIfAbsent(path, k -> new ArrayList<>()).add(hints);
             }
+        });
+    }
+
+    /** Receives a relation of the plan together with the conjuncts that guard its rows. */
+    @FunctionalInterface
+    public interface GuardedRelationConsumer {
+        void accept(LogicalPlan relation, List<Expression> guardingConjuncts);
+    }
+
+    /**
+     * The walk of {@link #collectHints}, for any kind of relation: hands each node that {@code isRelation} accepts to
+     * {@code consumer} with the conjuncts that guard it, and does not look below it.
+     */
+    public static void forEachGuardedRelation(LogicalPlan plan, Predicate<LogicalPlan> isRelation, GuardedRelationConsumer consumer) {
+        walk(plan, List.of(), isRelation, consumer);
+    }
+
+    private static void walk(
+        LogicalPlan node,
+        List<Expression> guardingConjuncts,
+        Predicate<LogicalPlan> isRelation,
+        GuardedRelationConsumer consumer
+    ) {
+        if (isRelation.test(node)) {
+            consumer.accept(node, guardingConjuncts);
             return;
         }
 
@@ -154,7 +288,7 @@ public final class PartitionFilterHintExtractor {
         }
 
         for (LogicalPlan child : node.children()) {
-            collectHints(child, conjuncts, result);
+            walk(child, conjuncts, isRelation, consumer);
         }
     }
 
@@ -163,17 +297,34 @@ public final class PartitionFilterHintExtractor {
         return expression.anyMatch(e -> e instanceof Attribute attr && names.contains(attr.name()));
     }
 
-    private static void extractFromExpression(Expression expr, List<PartitionFilterHint> hints) {
+    /**
+     * Names from the relation's {@code METADATA} clause that listing may treat as engine values.
+     */
+    private static Set<String> requestedMetadataNames(UnresolvedExternalRelation rel) {
+        Set<String> names = new LinkedHashSet<>();
+        for (NamedExpression field : rel.metadataFields()) {
+            names.add(MetadataAttribute.metadataName(field));
+        }
+        return names;
+    }
+
+    private static void extractFromExpression(Expression expr, List<PartitionFilterHint> hints, Set<String> requestedMetadata) {
         for (Expression conjunct : Predicates.splitAnd(expr)) {
             if (conjunct instanceof EsqlBinaryComparison comparison) {
-                extractFromComparison(comparison, hints);
+                extractFromComparison(comparison, hints, requestedMetadata);
             } else if (conjunct instanceof In in) {
-                extractFromIn(in, hints);
+                extractFromIn(in, hints, requestedMetadata);
+            } else if (conjunct instanceof WildcardLike like && like.caseInsensitive() == false) {
+                extractFromFileLike(like, hints, requestedMetadata);
             }
         }
     }
 
-    private static void extractFromComparison(EsqlBinaryComparison comparison, List<PartitionFilterHint> hints) {
+    private static void extractFromComparison(
+        EsqlBinaryComparison comparison,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata
+    ) {
         Expression left = comparison.left();
         Expression right = comparison.right();
 
@@ -181,16 +332,19 @@ public final class PartitionFilterHintExtractor {
         Object literalValue = null;
         boolean reversed = false;
 
-        if (left instanceof UnresolvedAttribute attr && right instanceof Literal lit) {
+        if (left instanceof UnresolvedAttribute attr && right instanceof Literal lit && hasListingUnits(lit)) {
             columnName = attr.name();
             literalValue = lit.value();
-        } else if (left instanceof Literal lit && right instanceof UnresolvedAttribute attr) {
+        } else if (left instanceof Literal lit && right instanceof UnresolvedAttribute attr && hasListingUnits(lit)) {
             columnName = attr.name();
             literalValue = lit.value();
             reversed = true;
         }
 
         if (columnName == null) {
+            return;
+        }
+        if (isUnrequestedFileMetadata(columnName, requestedMetadata)) {
             return;
         }
 
@@ -200,16 +354,20 @@ public final class PartitionFilterHintExtractor {
         }
     }
 
-    private static void extractFromIn(In in, List<PartitionFilterHint> hints) {
+    private static void extractFromIn(In in, List<PartitionFilterHint> hints, Set<String> requestedMetadata) {
         Expression value = in.value();
         if (value instanceof UnresolvedAttribute == false) {
             return;
         }
         UnresolvedAttribute attr = (UnresolvedAttribute) value;
+        String columnName = attr.name();
+        if (isUnrequestedFileMetadata(columnName, requestedMetadata)) {
+            return;
+        }
 
         List<Object> literalValues = new ArrayList<>();
         for (Expression listItem : in.list()) {
-            if (listItem instanceof Literal lit) {
+            if (listItem instanceof Literal lit && hasListingUnits(lit)) {
                 literalValues.add(normalizeValue(lit.value()));
             } else {
                 return;
@@ -217,8 +375,436 @@ public final class PartitionFilterHintExtractor {
         }
 
         if (literalValues.isEmpty() == false) {
-            hints.add(new PartitionFilterHint(attr.name(), Operator.IN, literalValues));
+            hints.add(new PartitionFilterHint(columnName, Operator.IN, literalValues));
         }
+    }
+
+    /**
+     * Pre-analysis {@code LIKE} on a requested {@code _file.*} column. Schema listing runs before
+     * analysis, so this is the only chance to apply the filename filter to that listing.
+     * Partition-key {@code LIKE} stays a comparison/{@code IN} concern of {@link #fromConjuncts}.
+     */
+    private static void extractFromFileLike(WildcardLike like, List<PartitionFilterHint> hints, Set<String> requestedMetadata) {
+        if (like.field() instanceof UnresolvedAttribute == false) {
+            return;
+        }
+        String columnName = ((UnresolvedAttribute) like.field()).name();
+        if (FileMetadataColumns.isFileMetadataColumn(columnName) == false || requestedMetadata.contains(columnName) == false) {
+            return;
+        }
+        hints.add(new PartitionFilterHint(columnName, Operator.LIKE, List.of(like.pattern().pattern())));
+    }
+
+    /**
+     * Resolved conjuncts for a scan re-list. Does not call {@link #extractFromComparison} —
+     * that helper requires {@link UnresolvedAttribute}.
+     */
+    private static void extractResolvedFromExpression(
+        Expression expr,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys,
+        LiteralNormalizer normalizer
+    ) {
+        for (Expression conjunct : Predicates.splitAnd(expr)) {
+            if (conjunct instanceof EsqlBinaryComparison comparison) {
+                extractResolvedFromComparison(comparison, hints, requestedMetadata, partitionKeys, normalizer);
+            } else if (conjunct instanceof In in) {
+                extractResolvedFromIn(in, hints, requestedMetadata, partitionKeys, normalizer);
+            } else if (conjunct instanceof StartsWith startsWith) {
+                if (extractResolvedFileAffixLike(
+                    startsWith.str(),
+                    startsWith.prefix(),
+                    "",
+                    "*",
+                    hints,
+                    requestedMetadata,
+                    normalizer
+                ) == false) {
+                    extractResolvedPrefix(startsWith.str(), startsWith.prefix(), hints, requestedMetadata, partitionKeys, normalizer);
+                }
+            } else if (conjunct instanceof Contains contains) {
+                extractResolvedFileAffixLike(contains.str(), contains.substr(), "*", "*", hints, requestedMetadata, normalizer);
+            } else if (conjunct instanceof EndsWith endsWith) {
+                extractResolvedFileAffixLike(endsWith.str(), endsWith.suffix(), "*", "", hints, requestedMetadata, normalizer);
+            } else if (conjunct instanceof WildcardLike like && like.caseInsensitive() == false) {
+                if (extractResolvedFileLike(like, hints, requestedMetadata) == false
+                    && like.pattern().shape() instanceof WildcardPattern.Shape.Prefix prefix) {
+                    // Partition keys still take the prefix range; _file.* already emitted LIKE above.
+                    extractResolvedPrefix(like.field(), prefix.literal(), hints, requestedMetadata, partitionKeys);
+                }
+            } else if (conjunct instanceof MvInRange mvInRange) {
+                extractResolvedMvInRange(mvInRange, hints, requestedMetadata, partitionKeys, normalizer);
+            } else if (conjunct instanceof MvGreater mvGreater) {
+                extractResolvedMvCompare(
+                    mvGreater.field(),
+                    mvGreater.bound(),
+                    Operator.GREATER_THAN_OR_EQUAL,
+                    hints,
+                    requestedMetadata,
+                    partitionKeys,
+                    normalizer
+                );
+            } else if (conjunct instanceof MvLess mvLess) {
+                extractResolvedMvCompare(
+                    mvLess.field(),
+                    mvLess.bound(),
+                    Operator.LESS_THAN_OR_EQUAL,
+                    hints,
+                    requestedMetadata,
+                    partitionKeys,
+                    normalizer
+                );
+            } else if (conjunct instanceof Range range) {
+                extractResolvedRange(range, hints, requestedMetadata, partitionKeys, normalizer);
+            }
+        }
+    }
+
+    private static void extractResolvedFromComparison(
+        EsqlBinaryComparison comparison,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys,
+        LiteralNormalizer normalizer
+    ) {
+        Expression left = comparison.left();
+        Expression right = comparison.right();
+
+        String columnName = resolvedColumnName(left);
+        Literal bound = null;
+        boolean reversed = false;
+        if (columnName != null && right instanceof Literal lit) {
+            bound = lit;
+        } else {
+            columnName = resolvedColumnName(right);
+            if (columnName != null && left instanceof Literal lit) {
+                bound = lit;
+                reversed = true;
+            }
+        }
+
+        if (columnName == null || bound == null || bound.value() == null) {
+            return;
+        }
+        if (isPrefixHintColumn(columnName, requestedMetadata, partitionKeys) == false) {
+            return;
+        }
+
+        Operator operator = toOperator(comparison, reversed);
+        if (operator != null) {
+            hints.add(new PartitionFilterHint(columnName, operator, List.of(normalizer.apply(bound))));
+        }
+    }
+
+    private static void extractResolvedFromIn(
+        In in,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys,
+        LiteralNormalizer normalizer
+    ) {
+        String columnName = resolvedColumnName(in.value());
+        if (columnName == null || isPrefixHintColumn(columnName, requestedMetadata, partitionKeys) == false) {
+            return;
+        }
+
+        List<Object> literalValues = new ArrayList<>();
+        for (Expression listItem : in.list()) {
+            if (listItem instanceof Literal lit) {
+                literalValues.add(normalizer.apply(lit));
+            } else {
+                return;
+            }
+        }
+
+        if (literalValues.isEmpty() == false) {
+            hints.add(new PartitionFilterHint(columnName, Operator.IN, literalValues));
+        }
+    }
+
+    /**
+     * Closed GTE+LTE. Inclusivity is not read: a closed interval is a superset of a
+     * half-open one, so the inclusive bound prunes fewer folders and never drops a live one.
+     */
+    private static void extractResolvedMvInRange(
+        MvInRange mvInRange,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys,
+        LiteralNormalizer normalizer
+    ) {
+        String columnName = resolvedColumnName(mvInRange.field());
+        if (columnName == null || isPrefixHintColumn(columnName, requestedMetadata, partitionKeys) == false) {
+            return;
+        }
+        Literal lower = scalarBound(mvInRange.lower());
+        Literal upper = scalarBound(mvInRange.upper());
+        if (lower == null || upper == null) {
+            return;
+        }
+        hints.add(new PartitionFilterHint(columnName, Operator.GREATER_THAN_OR_EQUAL, List.of(normalizer.apply(lower))));
+        hints.add(new PartitionFilterHint(columnName, Operator.LESS_THAN_OR_EQUAL, List.of(normalizer.apply(upper))));
+    }
+
+    /** GTE or LTE. {@code include_bound} is not read — same closed-superset stance as {@code MV_IN_RANGE}. */
+    private static void extractResolvedMvCompare(
+        Expression field,
+        Expression bound,
+        Operator operator,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys,
+        LiteralNormalizer normalizer
+    ) {
+        String columnName = resolvedColumnName(field);
+        if (columnName == null || isPrefixHintColumn(columnName, requestedMetadata, partitionKeys) == false) {
+            return;
+        }
+        Literal scalar = scalarBound(bound);
+        if (scalar == null) {
+            return;
+        }
+        hints.add(new PartitionFilterHint(columnName, operator, List.of(normalizer.apply(scalar))));
+    }
+
+    /** BETWEEN-shaped plans: inclusivity as written. */
+    private static void extractResolvedRange(
+        Range range,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys,
+        LiteralNormalizer normalizer
+    ) {
+        String columnName = resolvedColumnName(range.value());
+        if (columnName == null || isPrefixHintColumn(columnName, requestedMetadata, partitionKeys) == false) {
+            return;
+        }
+        Literal lower = scalarBound(range.lower());
+        Literal upper = scalarBound(range.upper());
+        if (lower == null || upper == null) {
+            return;
+        }
+        hints.add(
+            new PartitionFilterHint(
+                columnName,
+                range.includeLower() ? Operator.GREATER_THAN_OR_EQUAL : Operator.GREATER_THAN,
+                List.of(normalizer.apply(lower))
+            )
+        );
+        hints.add(
+            new PartitionFilterHint(
+                columnName,
+                range.includeUpper() ? Operator.LESS_THAN_OR_EQUAL : Operator.LESS_THAN,
+                List.of(normalizer.apply(upper))
+            )
+        );
+    }
+
+    /**
+     * A single non-null value. An ordered bound may be a list literal of the field's type
+     * ({@code mv_in_range}, {@code MvCompare}); a list is not a bound a folder comparison can use.
+     */
+    private static Literal scalarBound(Expression bound) {
+        if (bound instanceof Literal lit && lit.value() != null && lit.value() instanceof List == false) {
+            return lit;
+        }
+        return null;
+    }
+
+    private static void extractResolvedPrefix(
+        Expression column,
+        Expression prefixExpr,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys,
+        LiteralNormalizer normalizer
+    ) {
+        if (prefixExpr instanceof Literal lit && lit.value() != null) {
+            Object normalized = normalizer.apply(lit);
+            if (normalized instanceof String prefix) {
+                extractResolvedPrefix(column, prefix, hints, requestedMetadata, partitionKeys);
+            }
+        }
+    }
+
+    /**
+     * Case-sensitive {@code LIKE} on a requested {@code _file.*} column. The pattern is stored as-is;
+     * {@link PartitionValueMatcher} matches with
+     * {@link WildcardPattern} so listing cannot drop a file the row filter would keep. Returns
+     * {@code true} when a hint was added, so prefix {@code LIKE} on a partition key can still become
+     * a GTE/LT range.
+     */
+    private static boolean extractResolvedFileLike(WildcardLike like, List<PartitionFilterHint> hints, Set<String> requestedMetadata) {
+        String columnName = resolvedColumnName(like.field());
+        if (columnName == null || FileMetadataColumns.isFileMetadataColumn(columnName) == false) {
+            return false;
+        }
+        if (requestedMetadata.contains(columnName) == false) {
+            return false;
+        }
+        hints.add(new PartitionFilterHint(columnName, Operator.LIKE, List.of(like.pattern().pattern())));
+        return true;
+    }
+
+    /**
+     * {@code ReplaceRegexMatch} rewrites {@code LIKE "a-*z"} to {@code STARTS_WITH("a-") AND LIKE "a-*z"}.
+     * The prefix LIKE is a superset of the remaining pattern; drop it so listing compiles one automaton
+     * and the cache key names one pattern.
+     */
+    private static void dropSubsumedPrefixFileLikes(List<PartitionFilterHint> hints) {
+        if (hints.size() < 2) {
+            return;
+        }
+        hints.removeIf(hint -> isSubsumedPrefixFileLike(hint, hints));
+    }
+
+    private static boolean isSubsumedPrefixFileLike(PartitionFilterHint candidate, List<PartitionFilterHint> hints) {
+        if (candidate.operator() != Operator.LIKE || candidate.values().isEmpty()) {
+            return false;
+        }
+        String pattern = String.valueOf(candidate.values().get(0));
+        String prefix = prefixLikeLiteral(pattern);
+        if (prefix == null) {
+            return false;
+        }
+        for (PartitionFilterHint other : hints) {
+            if (other == candidate
+                || other.operator() != Operator.LIKE
+                || candidate.columnName().equals(other.columnName()) == false
+                || other.values().isEmpty()) {
+                continue;
+            }
+            String otherPattern = String.valueOf(other.values().get(0));
+            if (otherPattern.equals(pattern) == false && otherPattern.startsWith(StringUtils.escapeWildcardLiteral(prefix))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** Literal of a trailing-star {@code LIKE} with no other wildcards, or {@code null}. */
+    private static String prefixLikeLiteral(String pattern) {
+        return switch (new WildcardPattern(pattern).shape()) {
+            case WildcardPattern.Shape.Prefix(String literal) -> literal;
+            case WildcardPattern.Shape.Suffix ignored -> null;
+            case WildcardPattern.Shape.Contains ignored -> null;
+            case WildcardPattern.Shape.General ignored -> null;
+        };
+    }
+
+    /**
+     * {@code STARTS_WITH}/{@code CONTAINS}/{@code ENDS_WITH} that {@code ReplaceRegexMatch} emits
+     * for affix {@code LIKE}. Reconstruct the equivalent wildcard so listing uses the same automaton
+     * as the original {@code LIKE}. Literal metacharacters are escaped. Returns {@code true} when
+     * this is a requested {@code _file.*} column so a prefix {@code STARTS_WITH} does not also
+     * become a GTE/LT range.
+     */
+    private static boolean extractResolvedFileAffixLike(
+        Expression field,
+        Expression literalExpr,
+        String patternPrefix,
+        String patternSuffix,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        LiteralNormalizer normalizer
+    ) {
+        String columnName = resolvedColumnName(field);
+        if (columnName == null || FileMetadataColumns.isFileMetadataColumn(columnName) == false) {
+            return false;
+        }
+        if (requestedMetadata.contains(columnName) == false) {
+            return true;
+        }
+        if (literalExpr instanceof Literal lit && lit.value() != null) {
+            Object normalized = normalizer.apply(lit);
+            if (normalized instanceof String literal && literal.isEmpty() == false) {
+                hints.add(
+                    new PartitionFilterHint(
+                        columnName,
+                        Operator.LIKE,
+                        List.of(patternPrefix + StringUtils.escapeWildcardLiteral(literal) + patternSuffix)
+                    )
+                );
+            }
+        }
+        return true;
+    }
+
+    private static void extractResolvedPrefix(
+        Expression column,
+        String prefix,
+        List<PartitionFilterHint> hints,
+        Set<String> requestedMetadata,
+        Set<String> partitionKeys
+    ) {
+        String columnName = resolvedColumnName(column);
+        if (columnName == null || prefix.isEmpty() || isPrefixHintColumn(columnName, requestedMetadata, partitionKeys) == false) {
+            return;
+        }
+        hints.add(new PartitionFilterHint(columnName, Operator.GREATER_THAN_OR_EQUAL, List.of(prefix)));
+        BytesRef upper = StringPrefixUtils.nextPrefixUpperBound(new BytesRef(prefix));
+        if (upper != null) {
+            hints.add(new PartitionFilterHint(columnName, Operator.LESS_THAN, List.of(upper.utf8ToString())));
+        }
+    }
+
+    /**
+     * Resolved column on one side of a listing predicate. External data and hive partitions are
+     * {@link ReferenceAttribute}; {@code _file.*} is {@link ExternalMetadataAttribute}. Unresolved
+     * names and aliases are ignored.
+     */
+    private static String resolvedColumnName(Expression expr) {
+        return switch (expr) {
+            case FieldAttribute fa -> fa.name();
+            case ExternalMetadataAttribute ema -> ema.name();
+            case ReferenceAttribute ra -> ra.name();
+            default -> null;
+        };
+    }
+
+    /** Prefix ranges are listing keys only: requested {@code _file.*}, or a known partition column. */
+    private static boolean isPrefixHintColumn(String columnName, Set<String> requestedMetadata, Set<String> partitionKeys) {
+        if (FileMetadataColumns.isFileMetadataColumn(columnName)) {
+            return requestedMetadata.contains(columnName);
+        }
+        return partitionKeys.contains(columnName);
+    }
+
+    /**
+     * A {@code _file.*} predicate is a listing hint only when that name is in the relation's
+     * {@code METADATA} clause. Without the clause the name is an ordinary data column.
+     */
+    private static boolean isUnrequestedFileMetadata(String columnName, Set<String> requestedMetadata) {
+        return FileMetadataColumns.isFileMetadataColumn(columnName) && requestedMetadata.contains(columnName) == false;
+    }
+
+    /**
+     * Whether a literal can be a hint value of the listing. A hint carries the bare value and the listing reads
+     * a {@code Long} as milliseconds since the epoch, so a {@code date_nanos} constant would be taken for a time a
+     * million times later and prune files that match. Such a comparison is left to the query.
+     */
+    private static boolean hasListingUnits(Literal literal) {
+        return literal.dataType() != DataType.DATE_NANOS;
+    }
+
+    private static Object listingValue(Literal literal) {
+        return normalizeValue(literal.value());
+    }
+
+    private static Object temporalValue(Literal literal) {
+        Object value = literal.value();
+        if (value instanceof Number n) {
+            DataType type = literal.dataType();
+            if (type == DataType.DATETIME) {
+                return Instant.ofEpochMilli(n.longValue());
+            }
+            if (type == DataType.DATE_NANOS) {
+                long nanos = n.longValue();
+                return Instant.ofEpochSecond(Math.floorDiv(nanos, NANOS_PER_SECOND), Math.floorMod(nanos, NANOS_PER_SECOND));
+            }
+        }
+        return listingValue(literal);
     }
 
     private static Object normalizeValue(Object value) {

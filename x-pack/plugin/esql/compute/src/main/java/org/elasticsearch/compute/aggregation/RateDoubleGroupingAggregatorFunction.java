@@ -8,6 +8,7 @@ package org.elasticsearch.compute.aggregation;
 
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.IntroSorter;
+import org.apache.lucene.util.RamUsageEstimator;
 import org.elasticsearch.common.breaker.CircuitBreaker;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.ObjectArray;
@@ -30,7 +31,11 @@ import org.elasticsearch.compute.operator.Warnings;
 import org.elasticsearch.core.Releasable;
 import org.elasticsearch.core.Releasables;
 
+import java.util.Arrays;
 import java.util.List;
+
+import static org.elasticsearch.common.util.PartitionedHashTable.NUM_PARTITIONS;
+import static org.elasticsearch.common.util.PartitionedHashTable.PARTITION_WRITE_BATCH;
 
 public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGroupingFunction implements GroupingAggregatorFunction {
 
@@ -91,9 +96,6 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
     private final double dateFactor;
     private final Warnings warnings;
 
-    // track lastSliceIndex to allow flushing the raw buffer when the slice index changed
-    private int lastSliceIndex = -1;
-
     public RateDoubleGroupingAggregatorFunction(
         List<Integer> channels,
         DriverContext driverContext,
@@ -101,6 +103,7 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         boolean isDateNanos,
         Warnings warnings
     ) {
+        super(channels.get(3));
         this.channels = channels;
         this.driverContext = driverContext;
         this.isRateOverTime = isRateOverTime;
@@ -123,6 +126,13 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         }
     }
 
+    /**
+     * Returns the raw timestamp channel for debugging group assignments.
+     */
+    public int timestampChannel() {
+        return channels.get(1);
+    }
+
     @Override
     public void selectedMayContainUnseenGroups(SeenGroupIds seenGroupIds) {
         // manage nulls via buffers/reducedStates arrays
@@ -130,6 +140,7 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
 
     @Override
     public AddInput prepareProcessRawInputPage(SeenGroupIds seenGroupIds, Page page) {
+        maybeFlushOnNewSlice(page);
         DoubleBlock valuesBlock = page.getBlock(channels.get(0));
         if (valuesBlock.areAllValuesNull()) {
             return new AddInput() {
@@ -162,15 +173,8 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         }
         BytesRefBlock temporalityBlock = page.getBlock(channels.get(2));
         TemporalityAccessor temporalityAccessor = TemporalityAccessor.create(temporalityBlock, Temporality.CUMULATIVE);
-        IntVector sliceIndices = ((IntBlock) page.getBlock(channels.get(3))).asVector();
-        assert sliceIndices != null : "expected slice indices vector in time-series aggregation";
         LongVector futureMaxTimestamps = ((LongBlock) page.getBlock(channels.get(4))).asVector();
         assert futureMaxTimestamps != null : "expected future max timestamps vector in time-series aggregation";
-        int sliceIndex = sliceIndices.getInt(0);
-        if (sliceIndex > lastSliceIndex) {
-            flushRawBuffers();
-            lastSliceIndex = sliceIndex;
-        }
         return new AddInput() {
             @Override
             public void add(int positionOffset, IntArrayBlock groupIds) {
@@ -485,7 +489,14 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         IntVector selected,
         GroupingAggregatorEvaluationContext ctx
     ) {
+        if (ctx instanceof TimeSeriesGroupingAggregatorEvaluationContext tsContext) {
+            assert assertTimestampsWithinBuckets(selected, tsContext);
+            assert assertRawTimestampsWithinBuckets(rawBuffer, tsContext, (long) (dateFactor / 1000.0));
+        }
         flushRawBuffers();
+        if (ctx instanceof TimeSeriesGroupingAggregatorEvaluationContext tsContext) {
+            assert assertTimestampsWithinBuckets(selected, tsContext);
+        }
         return this::evaluateIntermediate;
     }
 
@@ -566,6 +577,211 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         }
     }
 
+    @Override
+    public boolean supportPartitioning(AggregatorMode mode) {
+        return mode.isInputPartial();
+    }
+
+    @Override
+    public PartitionSplitter createPartitioningSplitter(CircuitBreaker breaker) {
+        if (rawBuffer.sliceCount > 0 || rawBuffer.timestamps.size() > 0) {
+            throw new IllegalStateException("can't partition rate raw buffer");
+        }
+        assert assertNoDeltaStates();
+        return new RatePartitionSplitter(breaker);
+    }
+
+    private boolean assertNoDeltaStates() {
+        for (long groupId = 0; groupId < deltaStates.size(); groupId++) {
+            assert deltaStates.get(groupId) == null : "unflushed delta samples for group " + groupId;
+        }
+        return true;
+    }
+
+    @Override
+    public void combinePartition(PartitionedState source, int partition, boolean appendOnly, int[] dstIds, int length) {
+        final RatePartition src = ((RatePartitionedState) source).partitions[partition];
+        int interval = 0;
+        for (int i = 0; i < length; i++) {
+            final int count = src.intervalCounts[i];
+            if (src.samples[i] == 0) {
+                assert count == 0;
+                continue;
+            }
+            ReducedState state = getOrInitializeReducedState(dstIds[i]);
+            state.samples += src.samples[i];
+            state.resets += src.resets[i];
+            state.appendIntervals(src.intervalTs, src.intervalValues, interval, count);
+            interval += count;
+        }
+    }
+
+    static long arrayBytes(int length, int bytesPerElement) {
+        return RamUsageEstimator.alignObjectSize((long) RamUsageEstimator.NUM_BYTES_ARRAY_HEADER + (long) bytesPerElement * length);
+    }
+
+    static final class RatePartition {
+        static final long BASE_RAM_USAGE = RamUsageEstimator.shallowSizeOf(RatePartition.class);
+        long[] samples;
+        double[] resets;
+        int[] intervalCounts;
+        long[] intervalTs;
+        double[] intervalValues;
+        int numIntervals;
+
+        RatePartition(int keys) {
+            samples = new long[keys];
+            resets = new double[keys];
+            intervalCounts = new int[keys];
+            intervalTs = new long[keys * 2];
+            intervalValues = new double[keys * 2];
+        }
+
+        static long keyBytes(int keys) {
+            return arrayBytes(keys, Long.BYTES) + arrayBytes(keys, Double.BYTES) + arrayBytes(keys, Integer.BYTES);
+        }
+
+        static long intervalBytes(int slots) {
+            return arrayBytes(slots, Long.BYTES) + arrayBytes(slots, Double.BYTES);
+        }
+
+        long bytes() {
+            return BASE_RAM_USAGE + keyBytes(samples.length) + intervalBytes(intervalTs.length);
+        }
+    }
+
+    static final class RatePartitionedState implements PartitionedState {
+        static final long BASE_RAM_USAGE = RamUsageEstimator.shallowSizeOf(RatePartitionedState.class) + arrayBytes(
+            NUM_PARTITIONS,
+            RamUsageEstimator.NUM_BYTES_OBJECT_REF
+        );
+        final RatePartition[] partitions = new RatePartition[NUM_PARTITIONS];
+
+        RatePartitionedState(int partitionSize) {
+            for (int p = 0; p < NUM_PARTITIONS; p++) {
+                partitions[p] = new RatePartition(partitionSize);
+            }
+        }
+
+        @Override
+        public boolean hasAllValues(int partition) {
+            return false;
+        }
+
+        @Override
+        public void releasePartition(CircuitBreaker breaker, int partition) {
+            if (partitions[partition] != null) {
+                breaker.addWithoutBreaking(-partitions[partition].bytes());
+                partitions[partition] = null;
+            }
+        }
+
+        @Override
+        public void releaseAll(CircuitBreaker breaker) {
+            long usedBytes = BASE_RAM_USAGE;
+            for (int p = 0; p < NUM_PARTITIONS; p++) {
+                if (partitions[p] != null) {
+                    usedBytes += partitions[p].bytes();
+                    partitions[p] = null;
+                }
+            }
+            breaker.addWithoutBreaking(-usedBytes);
+        }
+    }
+
+    private final class RatePartitionSplitter implements PartitionSplitter {
+        private final CircuitBreaker breaker;
+        private RatePartitionedState state;
+
+        RatePartitionSplitter(CircuitBreaker breaker) {
+            this.breaker = breaker;
+            final int numGroups = Math.toIntExact(reducedStates.size());
+            final int partitionSize = ArrayUtil.oversize(Math.max(1, Math.ceilDiv(numGroups, NUM_PARTITIONS)), Long.BYTES);
+            final long partitionBytes = RatePartition.BASE_RAM_USAGE + RatePartition.keyBytes(partitionSize) + RatePartition.intervalBytes(
+                partitionSize * 2
+            );
+            breaker.addEstimateBytesAndMaybeBreak(
+                RatePartitionedState.BASE_RAM_USAGE + NUM_PARTITIONS * partitionBytes,
+                "RateDoubleGroupingAggregatorFunction#partition"
+            );
+            state = new RatePartitionedState(partitionSize);
+            assert state.partitions[0].bytes() == partitionBytes;
+        }
+
+        @Override
+        public void split(int firstId, short[] shiftedIds, int batchSize, int[] batchPartitionCounts, int[] partitionOffsets) {
+            for (int p = 0; p < NUM_PARTITIONS; p++) {
+                final int count = batchPartitionCounts[p];
+                if (count == 0) {
+                    continue;
+                }
+                final int offset = partitionOffsets[p];
+                final RatePartition dst = state.partitions[p];
+                if (dst.samples.length < offset + count) {
+                    growKeys(dst, offset + count);
+                }
+                final int base = p * PARTITION_WRITE_BATCH;
+                for (int i = 0; i < count; i++) {
+                    final int id = firstId + shiftedIds[base + i];
+                    final ReducedState src = id < reducedStates.size() ? reducedStates.get(id) : null;
+                    if (src == null || src.samples == 0) {
+                        continue;
+                    }
+                    dst.samples[offset + i] = src.samples;
+                    dst.resets[offset + i] = src.resets;
+                    dst.intervalCounts[offset + i] = src.intervals.length;
+                    int slot = dst.numIntervals * 2;
+                    final int end = slot + src.intervals.length * 2;
+                    if (dst.intervalTs.length < end) {
+                        growIntervals(dst, end);
+                    }
+                    for (int intervalId : src.intervals) {
+                        dst.intervalTs[slot] = intervalBuffer.lastTs(intervalId);
+                        dst.intervalValues[slot] = intervalBuffer.lastValue(intervalId);
+                        dst.intervalTs[slot + 1] = intervalBuffer.firstTs(intervalId);
+                        dst.intervalValues[slot + 1] = intervalBuffer.firstValue(intervalId);
+                        slot += 2;
+                    }
+                    dst.numIntervals += src.intervals.length;
+                }
+            }
+        }
+
+        private void growKeys(RatePartition dst, int minLength) {
+            final int oldLength = dst.samples.length;
+            final int newLength = ArrayUtil.oversize(minLength, Long.BYTES);
+            breaker.addEstimateBytesAndMaybeBreak(RatePartition.keyBytes(newLength), "RateDoubleGroupingAggregatorFunction#partition");
+            dst.samples = Arrays.copyOf(dst.samples, newLength);
+            dst.resets = Arrays.copyOf(dst.resets, newLength);
+            dst.intervalCounts = Arrays.copyOf(dst.intervalCounts, newLength);
+            breaker.addWithoutBreaking(-RatePartition.keyBytes(oldLength));
+        }
+
+        private void growIntervals(RatePartition dst, int minLength) {
+            final int oldLength = dst.intervalTs.length;
+            final int newLength = ArrayUtil.oversize(minLength, Long.BYTES);
+            breaker.addEstimateBytesAndMaybeBreak(RatePartition.intervalBytes(newLength), "RateDoubleGroupingAggregatorFunction#partition");
+            dst.intervalTs = Arrays.copyOf(dst.intervalTs, newLength);
+            dst.intervalValues = Arrays.copyOf(dst.intervalValues, newLength);
+            breaker.addWithoutBreaking(-RatePartition.intervalBytes(oldLength));
+        }
+
+        @Override
+        public RatePartitionedState finish() {
+            final RatePartitionedState result = state;
+            state = null;
+            return result;
+        }
+
+        @Override
+        public void release(CircuitBreaker breaker) {
+            if (state != null) {
+                state.releaseAll(breaker);
+                state = null;
+            }
+        }
+    }
+
     static final class DoubleRawBuffer extends RawBuffer {
         private final DoubleBuffer values;
 
@@ -580,6 +796,19 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
                     close();
                 }
             }
+        }
+
+        void append(int groupId, long timestamp, double value) {
+            prepareForAppend(groupId, 1, timestamp);
+            appendWithoutResize(timestamp, value);
+        }
+
+        long timestamp(int position) {
+            return timestamps.get(position);
+        }
+
+        double value(int position) {
+            return values.get(position);
         }
 
         void prepareForAppend(int groupId, int count, long firstTimestamp) {
@@ -707,6 +936,18 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         GroupingAggregatorEvaluationContext ctx
     ) {
         flushRawBuffers();
+        for (int p = 0; p < selected.getPositionCount(); p++) {
+            int group = selected.getInt(p);
+            var state = group < reducedStates.size() ? reducedStates.get(group) : null;
+            if (state != null && state.samples > 1) {
+                state.combineIntervals();
+            }
+        }
+        if (ctx instanceof TimeSeriesGroupingAggregatorEvaluationContext tsContext) {
+            tsContext.computeAdjacentGroupIds();
+            // https://github.com/elastic/elasticsearch/issues/152758
+            assert assertTimestampsWithinBuckets(selected, tsContext);
+        }
         return (blocks, offset, selectedInPage) -> evaluateFinal(blocks, offset, selectedInPage, ctx);
     }
 
@@ -714,18 +955,6 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         BlockFactory blockFactory = driverContext.blockFactory();
         int positionCount = selectedInPage.getPositionCount();
         try (var rates = blockFactory.newDoubleBlockBuilder(positionCount)) {
-            for (int p = 0; p < positionCount; p++) {
-                int group = selectedInPage.getInt(p);
-                var state = group < reducedStates.size() ? reducedStates.get(group) : null;
-                if (state != null && state.samples > 1) {
-                    state.combineIntervals();
-                }
-            }
-            if (ctx instanceof TimeSeriesGroupingAggregatorEvaluationContext tsContext) {
-                tsContext.computeAdjacentGroupIds();
-                // https://github.com/elastic/elasticsearch/issues/152758
-                assert assertTimestampsWithinBuckets(selectedInPage, tsContext);
-            }
             for (int p = 0; p < positionCount; p++) {
                 int group = selectedInPage.getInt(p);
                 var state = group < reducedStates.size() ? reducedStates.get(group) : null;
@@ -763,11 +992,49 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
             }
             long bucketStart = tsContext.rangeStartInMillis(group) * (long) (dateFactor / 1000.0);
             long bucketEnd = tsContext.rangeEndInMillis(group) * (long) (dateFactor / 1000.0);
-            assert state.firstTs() >= bucketStart
-                : "firstTs " + state.firstTs() + " is before bucket start " + bucketStart + " for group " + group;
-            assert state.lastTs() <= bucketEnd : "lastTs " + state.lastTs() + " is after bucket end " + bucketEnd + " for group " + group;
+            for (int intervalId : state.intervals) {
+                long firstTs = intervalBuffer.firstTs(intervalId);
+                long lastTs = intervalBuffer.lastTs(intervalId);
+                assert firstTs >= bucketStart
+                    : describeMisbucketedGroup("firstTs " + firstTs + " is before bucket start", group, state, bucketStart, bucketEnd);
+                assert lastTs <= bucketEnd
+                    : describeMisbucketedGroup("lastTs " + lastTs + " is after bucket end", group, state, bucketStart, bucketEnd);
+            }
         }
         return true;
+    }
+
+    /**
+     * Describes a group whose raw timestamps escaped its time bucket, listing every interval the group holds.
+     * The breakdown tells the two possible causes apart: a single interval spanning several buckets points at the
+     * raw-input buffering on the data node, while an extra interval sitting entirely in another bucket points at an
+     * intermediate state that was merged into the wrong group.
+     */
+    private String describeMisbucketedGroup(String problem, int group, ReducedState state, long bucketStart, long bucketEnd) {
+        StringBuilder sb = new StringBuilder(problem);
+        sb.append(" for group ").append(group);
+        sb.append("; bucket=[").append(bucketStart).append(", ").append(bucketEnd).append(']');
+        sb.append(", bucketWidth=").append(bucketEnd - bucketStart);
+        sb.append(", samples=").append(state.samples);
+        sb.append(", resets=").append(state.resets);
+        // combineIntervals, which sorts the intervals so first*()/last*() are meaningful, only runs for samples > 1
+        sb.append(", combined=").append(state.samples > 1);
+        sb.append(", intervals=").append(state.intervals.length).append('[');
+        for (int i = 0; i < state.intervals.length; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            int intervalId = state.intervals[i];
+            long firstTs = intervalBuffer.firstTs(intervalId);
+            long lastTs = intervalBuffer.lastTs(intervalId);
+            sb.append("{id=").append(intervalId);
+            sb.append(", firstTs=").append(firstTs).append(", firstValue=").append(intervalBuffer.firstValue(intervalId));
+            sb.append(", lastTs=").append(lastTs).append(", lastValue=").append(intervalBuffer.lastValue(intervalId));
+            // offsets are relative to bucketStart, so an in-bucket interval has 0 <= firstTsOffset <= lastTsOffset <= bucketWidth
+            sb.append(", firstTsOffset=").append(firstTs - bucketStart).append(", lastTsOffset=").append(lastTs - bucketStart);
+            sb.append('}');
+        }
+        return sb.append(']').toString();
     }
 
     @Override
@@ -834,6 +1101,19 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
             return id;
         }
 
+        int appendIntervals(long[] ts, double[] vs, int fromInterval, int count) {
+            final int from = fromInterval * 2;
+            final int n = count * 2;
+            timestamps.ensureCapacity(timestamps.size() + n);
+            values.ensureCapacity(values.size() + n);
+            final int firstId = count();
+            for (int i = from; i < from + n; i++) {
+                timestamps.append(ts[i]);
+                values.append(vs[i]);
+            }
+            return firstId;
+        }
+
         int appendIntervalsFromBlocks(LongBlock ts, DoubleBlock vs, int position) {
             int tsFirst = ts.getFirstValueIndex(position);
             int vsFirst = vs.getFirstValueIndex(position);
@@ -877,6 +1157,15 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
             int currentSize = intervals.length;
             this.intervals = ArrayUtil.growExact(intervals, currentSize + 1);
             this.intervals[currentSize] = intervalBuffer.appendInterval(lastTs, lastValue, firstTs, firstValue);
+        }
+
+        void appendIntervals(long[] ts, double[] vs, int fromInterval, int count) {
+            int firstIntervalId = intervalBuffer.appendIntervals(ts, vs, fromInterval, count);
+            int currentSize = intervals.length;
+            intervals = ArrayUtil.growExact(intervals, currentSize + count);
+            for (int i = 0; i < count; i++) {
+                intervals[currentSize++] = firstIntervalId + i;
+            }
         }
 
         void appendIntervalsFromBlocks(LongBlock ts, DoubleBlock vs, int position) {
@@ -996,6 +1285,35 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         }
     }
 
+    private int findPreviousGroupWithSamples(int group, TimeSeriesGroupingAggregatorEvaluationContext context) {
+        int candidate = context.previousGroupId(group);
+        // the previous group for this TSID is not guaranteed to have values for our metric
+        // It might exist due to another metric which is part of the same query
+        // so we have to look back further in case it has no values
+        // This is an edge case though, typically this loop exits in the first iteration
+        while (AbstractRateGroupingFunction.isPreviousGroupWithinLookback(context, candidate, group)) {
+            ReducedState state = candidate < reducedStates.size() ? reducedStates.get(candidate) : null;
+            if (state != null && state.samples > 0) {
+                return candidate;
+            }
+            candidate = context.previousGroupId(candidate);
+        }
+        return -1;
+    }
+
+    private int findNextGroupWithSamples(int group, TimeSeriesGroupingAggregatorEvaluationContext context) {
+        int candidate = context.nextGroupId(group);
+        // See findPreviousGroupWithSamples for why the loop is needed
+        while (AbstractRateGroupingFunction.isNextGroupWithinLookback(context, group, candidate)) {
+            ReducedState state = candidate < reducedStates.size() ? reducedStates.get(candidate) : null;
+            if (state != null && state.samples > 0) {
+                return candidate;
+            }
+            candidate = context.nextGroupId(candidate);
+        }
+        return -1;
+    }
+
     /**
      * Computes the rate for a given group by interpolating boundary values with adjacent groups,
      * or extrapolating values at the time bucket boundaries.
@@ -1014,9 +1332,9 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         double firstTsSec = tbucketStart;
         double lastTsSec = tbucketEnd;
 
-        int previousGroupId = tsContext.previousGroupId(group);
-        var previousState = (0 <= previousGroupId && previousGroupId < reducedStates.size()) ? reducedStates.get(previousGroupId) : null;
-        if (previousState == null || previousState.samples == 0) {
+        int previousGroupId = findPreviousGroupWithSamples(group, tsContext);
+        ReducedState previousState = previousGroupId >= 0 ? reducedStates.get(previousGroupId) : null;
+        if (previousState == null) {
             if (state.samples == 1) {
                 firstTsSec = state.firstTs() / dateFactor;
                 firstValue = state.firstValue();
@@ -1024,12 +1342,15 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
                 firstValue = extrapolateToBoundary(state, tbucketStart, tbucketEnd, dateFactor, true);
             }
         } else {
-            firstValue = interpolateBetweenStates(previousState, state, tbucketStart, tbucketEnd, dateFactor, true);
+            long previousBucketEnd = tsContext.rangeEndInMillis(previousGroupId);
+            long currentBucketStart = tsContext.rangeStartInMillis(group);
+            firstTsSec = AbstractRateGroupingFunction.interpolationBoundaryInSeconds(previousBucketEnd, currentBucketStart);
+            firstValue = interpolateBetweenStates(previousState, state, firstTsSec, dateFactor, true);
         }
 
-        int nextGroupId = tsContext.nextGroupId(group);
-        var nextState = (nextGroupId >= 0 && nextGroupId < reducedStates.size()) ? reducedStates.get(nextGroupId) : null;
-        if (nextState == null || nextState.samples == 0) {
+        int nextGroupId = findNextGroupWithSamples(group, tsContext);
+        ReducedState nextState = nextGroupId >= 0 ? reducedStates.get(nextGroupId) : null;
+        if (nextState == null) {
             if (state.samples == 1) {
                 lastTsSec = state.lastTs() / dateFactor;
                 lastValue = state.lastValue() + state.resets;
@@ -1037,7 +1358,10 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
                 lastValue = extrapolateToBoundary(state, tbucketStart, tbucketEnd, dateFactor, false);
             }
         } else {
-            lastValue = interpolateBetweenStates(state, nextState, tbucketStart, tbucketEnd, dateFactor, false) + state.resets;
+            long currentBucketEnd = tsContext.rangeEndInMillis(group);
+            long nextBucketStart = tsContext.rangeStartInMillis(nextGroupId);
+            lastTsSec = AbstractRateGroupingFunction.interpolationBoundaryInSeconds(currentBucketEnd, nextBucketStart);
+            lastValue = interpolateBetweenStates(state, nextState, lastTsSec, dateFactor, false) + state.resets;
         }
 
         if (lastTsSec == firstTsSec) {
@@ -1111,11 +1435,7 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
     }
 
     /**
-     * Interpolates the value at the time bucket boundary between two states.
-     *
-     * For the lower boundary (tbucketStart), interpolation is applied between the last sample of the lower state
-     * and the first sample of the upper state. Conversely, for the upper boundary (tbucketEnd), interpolation
-     * is applied between the first sample of the lower state and the last sample of the upper state.
+     * Interpolates the value at {@code boundary} between two states.
      *
      * The logic detects counter resets across the boundary, with interpolation using the last value instead of the
      * value delta to produce correct results.
@@ -1123,8 +1443,7 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
     private double interpolateBetweenStates(
         ReducedState lowerState,
         ReducedState upperState,
-        double tbucketStart,
-        double tbucketEnd,
+        double boundary,
         double dateFactor,
         boolean isLowerBoundary
     ) {
@@ -1133,18 +1452,12 @@ public final class RateDoubleGroupingAggregatorFunction extends AbstractRateGrou
         final double endValue = upperState.firstValue();
         final double endTs = upperState.firstTs() / dateFactor;
         assert startTs < endTs : "expected startTs < endTs, got " + startTs + " < " + endTs;
+        assert startTs <= boundary : startTs + " <= " + boundary;
+        assert boundary <= endTs : boundary + " <= " + endTs;
         final double delta = deltaBetweenStates(lowerState, upperState, dateFactor);
         final double slope = delta / (endTs - startTs);
-        if (isLowerBoundary) {
-            assert startTs <= tbucketStart : startTs + " <= " + tbucketStart;
-            final double baseValue = (endValue >= startValue) ? startValue : 0;
-            double timeDelta = tbucketStart - startTs;
-            return baseValue + slope * timeDelta;
-        } else {
-            assert startTs <= tbucketEnd : startTs + " <= " + tbucketEnd;
-            double timeDelta = tbucketEnd - startTs;
-            return startValue + slope * timeDelta;
-        }
+        final double baseValue = isLowerBoundary && endValue < startValue ? 0 : startValue;
+        return baseValue + slope * (boundary - startTs);
     }
 
     private double deltaBetweenStates(ReducedState lowerState, ReducedState upperState, double dateFactor) {

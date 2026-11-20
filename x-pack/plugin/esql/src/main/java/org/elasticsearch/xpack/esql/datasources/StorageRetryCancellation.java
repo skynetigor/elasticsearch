@@ -7,10 +7,17 @@
 
 package org.elasticsearch.xpack.esql.datasources;
 
+import org.elasticsearch.common.util.concurrent.FutureUtils;
 import org.elasticsearch.core.CheckedRunnable;
 import org.elasticsearch.core.CheckedSupplier;
 import org.elasticsearch.tasks.TaskCancelledException;
 
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.function.BooleanSupplier;
 
 /**
@@ -27,8 +34,9 @@ import java.util.function.BooleanSupplier;
  * exit; when no scope is active {@link #isCancelled()} returns {@code false}.
  *
  * <p><b>Scope.</b> Scopes are installed around coordinator-side split-discovery and source-resolution footer
- * reads (see {@code ExternalSourceResolver}) and around the data-node runtime producer read (see
- * {@code AsyncExternalSourceOperatorFactory} and {@code ExternalSourceDrainUtils}). The runtime scope is keyed
+ * reads (see {@code ExternalSourceResolver}), around the data-node runtime producer read (see
+ * {@code AsyncExternalSourceOperatorFactory} and {@code ExternalSourceDrainUtils}), and around deferred
+ * column materialization (see {@code ExternalFieldExtractOperator}). The runtime producer scope is keyed
  * to {@code AsyncExternalSourceBuffer.readCancelled()} — a hard cut of a still-running producer (task cancel /
  * async DELETE / LIMIT teardown), but <em>not</em> async STOP, which keeps buffered pages for a partial
  * response and must therefore let an in-flight read complete cooperatively rather than abort it mid-backoff.
@@ -63,8 +71,15 @@ import java.util.function.BooleanSupplier;
  * uncancellable operation off the scoped thread; that residual case is bounded only by the underlying layer's
  * own timeout, not by cancellation. Closing that gap needs interrupt-/stream-abort-based cancellation and is a
  * separate change.
+ *
+ * <p><b>Parked, not blocked.</b> Everything above concerns a producer <em>blocked</em> inside a page pull. A
+ * producer that instead <em>parks</em> on the iterator's {@code waitForReady()} (async Parquet: a byte-budget
+ * ticket or an in-flight GET) never enters this scope's sleep; it is woken by
+ * {@code AsyncExternalSourceBuffer#waitForReadyOrFinished} on any finish — STOP included — and exits between
+ * pages, closing the iterator and with it the pending ticket / GET. Neither the STOP lag nor the degenerate case
+ * described above applies to that park.
  */
-final class StorageRetryCancellation {
+public final class StorageRetryCancellation {
 
     private static final ThreadLocal<BooleanSupplier> CURRENT = new ThreadLocal<>();
 
@@ -84,7 +99,7 @@ final class StorageRetryCancellation {
      * Runs {@code body} with {@code isCancelled} installed as the ambient cancellation signal for the
      * current thread, restoring any previously installed supplier on exit (so nested scopes compose).
      */
-    static <E extends Exception> void runWithCancellation(BooleanSupplier isCancelled, CheckedRunnable<E> body) throws E {
+    public static <E extends Exception> void runWithCancellation(BooleanSupplier isCancelled, CheckedRunnable<E> body) throws E {
         BooleanSupplier previous = CURRENT.get();
         CURRENT.set(isCancelled);
         try {
@@ -117,9 +132,54 @@ final class StorageRetryCancellation {
     }
 
     /** Returns {@code true} when an ambient cancellation signal is installed and reports cancelled. */
-    static boolean isCancelled() {
+    public static boolean isCancelled() {
         BooleanSupplier current = CURRENT.get();
         return current != null && current.getAsBoolean();
+    }
+
+    /**
+     * The ambient cancellation supplier on this thread, or {@code null} when no scope is
+     * installed. Grant threads re-install this around GET start.
+     */
+    public static BooleanSupplier current() {
+        return CURRENT.get();
+    }
+
+    /**
+     * Waits for {@code future} while remaining responsive to {@link #isCancelled()}. The delay is
+     * consumed in {@link #POLL_INTERVAL_MS} chunks so a cancel that arrives while the caller is
+     * blocked aborts instead of waiting for the GET to finish. A cancelled future is surfaced as
+     * {@link TaskCancelledException} so callers do not treat it as a prefetch miss and start a
+     * replacement GET.
+     */
+    public static <T> T getWithCancellationChecks(CompletableFuture<T> future) {
+        while (true) {
+            if (isCancelled()) {
+                FutureUtils.cancel(future);
+                throw new TaskCancelledException(CANCELLED_MESSAGE);
+            }
+            try {
+                return future.get(POLL_INTERVAL_MS, TimeUnit.MILLISECONDS);
+            } catch (TimeoutException ignored) {
+                // poll again
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                FutureUtils.cancel(future);
+                throw new TaskCancelledException(CANCELLED_MESSAGE);
+            } catch (CancellationException e) {
+                FutureUtils.cancel(future);
+                throw new TaskCancelledException(CANCELLED_MESSAGE);
+            } catch (ExecutionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof RuntimeException runtimeException) {
+                    throw runtimeException;
+                }
+                if (cause instanceof Error error) {
+                    throw error;
+                }
+                throw new CompletionException(cause);
+            }
+        }
     }
 
     /**

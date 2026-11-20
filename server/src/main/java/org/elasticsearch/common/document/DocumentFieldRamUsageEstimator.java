@@ -10,6 +10,7 @@
 package org.elasticsearch.common.document;
 
 import org.apache.lucene.util.RamUsageEstimator;
+import org.elasticsearch.common.lucene.RamUsageEstimates;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -41,26 +42,10 @@ public final class DocumentFieldRamUsageEstimator {
     private static final int ARRAY_HEADER_BYTES = RamUsageEstimator.NUM_BYTES_ARRAY_HEADER;
     private static final int OBJECT_HEADER_BYTES = RamUsageEstimator.NUM_BYTES_OBJECT_HEADER;
 
-    private static final long HASH_MAP_ENTRY_BYTES;
-    private static final long LINKED_HASH_MAP_ENTRY_BYTES;
-    private static final long TREE_MAP_ENTRY_BYTES;
-    private static final long LINKED_LIST_NODE_BYTES;
-
-    static {
-        HashMap<Integer, Integer> hm = new HashMap<>();
-        hm.put(0, 0);
-        HASH_MAP_ENTRY_BYTES = RamUsageEstimator.shallowSizeOf(hm.entrySet().iterator().next());
-
-        LinkedHashMap<Integer, Integer> lhm = new LinkedHashMap<>();
-        lhm.put(0, 0);
-        LINKED_HASH_MAP_ENTRY_BYTES = RamUsageEstimator.shallowSizeOf(lhm.entrySet().iterator().next());
-
-        TreeMap<Integer, Integer> tm = new TreeMap<>();
-        tm.put(0, 0);
-        TREE_MAP_ENTRY_BYTES = RamUsageEstimator.shallowSizeOf(tm.entrySet().iterator().next());
-
-        LINKED_LIST_NODE_BYTES = RamUsageEstimator.alignObjectSize(OBJECT_HEADER_BYTES + 3L * REF_BYTES);
-    }
+    private static final long HASH_MAP_ENTRY_BYTES = RamUsageEstimates.HASH_MAP_NODE_SIZE;
+    private static final long LINKED_HASH_MAP_ENTRY_BYTES = RamUsageEstimates.LINKED_HASH_MAP_NODE_SIZE;
+    private static final long TREE_MAP_ENTRY_BYTES = RamUsageEstimates.TREE_MAP_NODE_SIZE;
+    private static final long LINKED_LIST_NODE_BYTES = RamUsageEstimator.alignObjectSize(OBJECT_HEADER_BYTES + 3L * REF_BYTES);
 
     private DocumentFieldRamUsageEstimator() {}
 
@@ -102,7 +87,7 @@ public final class DocumentFieldRamUsageEstimator {
     }
 
     private static long estimateMap(Map<?, ?> map, int depth) {
-        long size = RamUsageEstimator.shallowSizeOf(map);
+        long size = RamUsageEstimates.shallowSizeOf(map);
         int entries = map.size();
         if (entries == 0) {
             return size;
@@ -135,16 +120,11 @@ public final class DocumentFieldRamUsageEstimator {
     }
 
     private static long hashTableCapacity(int size) {
-        long minSlots = Math.max(16L, (long) Math.ceil(size / 0.75f));
-        long capacity = 16L;
-        while (capacity < minSlots) {
-            capacity <<= 1;
-        }
-        return capacity;
+        return Math.max(16L, RamUsageEstimates.hashTableSlots(size));
     }
 
     private static long estimateCollection(Collection<?> collection, int depth) {
-        long size = RamUsageEstimator.shallowSizeOf(collection);
+        long size = RamUsageEstimates.shallowSizeOf(collection);
         int n = collection.size();
 
         if (collection instanceof LinkedList<?>) {
@@ -157,11 +137,13 @@ public final class DocumentFieldRamUsageEstimator {
             long capacity = Math.max(16L, Long.highestOneBit((long) n * 2L - 1L) << 1);
             size += ARRAY_HEADER_BYTES + capacity * REF_BYTES;
         } else if (collection instanceof HashSet<?> || collection instanceof LinkedHashSet<?>) {
-            size += RamUsageEstimator.shallowSizeOfInstance(collection instanceof LinkedHashSet<?> ? LinkedHashMap.class : HashMap.class);
+            size += collection instanceof LinkedHashSet<?>
+                ? RamUsageEstimates.LINKED_HASH_MAP_SHALLOW_SIZE
+                : RamUsageEstimates.HASH_MAP_SHALLOW_SIZE;
             size += ARRAY_HEADER_BYTES + hashTableCapacity(n) * (long) REF_BYTES;
             size += n * (collection instanceof LinkedHashSet<?> ? LINKED_HASH_MAP_ENTRY_BYTES : HASH_MAP_ENTRY_BYTES);
         } else if (collection instanceof TreeSet<?>) {
-            size += RamUsageEstimator.shallowSizeOfInstance(TreeMap.class);
+            size += RamUsageEstimates.TREE_MAP_SHALLOW_SIZE;
             size += n * TREE_MAP_ENTRY_BYTES;
         } else if (n > 0) {
             long capacity = Math.max(10L, (long) Math.ceil(n * 1.5));

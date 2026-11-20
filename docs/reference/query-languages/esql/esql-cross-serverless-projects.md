@@ -1,7 +1,7 @@
 ---
 applies_to:
   stack: unavailable
-  serverless: preview
+  serverless: ga
 products:
   - id: elasticsearch
 description: Learn how to use the ES|QL language in Elasticsearch to query across multiple Serverless projects. Learn about index resolution, project routing, and accessing project metadata.
@@ -23,7 +23,7 @@ There are several ways to control which projects a query runs against:
 This page covers {{esql}}-specific CPS behavior. Before continuing, make sure you are familiar with the following:
 
 * [Cross-project search](docs-content://explore-analyze/cross-project-search.md)
-* [Linked projects](docs-content://explore-analyze/cross-project-search/cross-project-search-link-projects.md)
+* [Linked projects](docs-content://deploy-manage/cross-project-search-config/cps-config-link-and-manage.md)
 * [How search works in CPS](docs-content://explore-analyze/cross-project-search/cross-project-search-search.md)
 * [Project routing in CPS](docs-content://explore-analyze/cross-project-search/cross-project-search-project-routing.md)
 * [Tags in CPS](docs-content://explore-analyze/cross-project-search/cross-project-search-tags.md)
@@ -400,6 +400,8 @@ FROM logs METADATA _project._alias        <2>
 
 Two [{{esql}} cross-cluster search limitations](/reference/query-languages/esql/esql-cross-clusters.md#ccq-limitations) also apply to cross-project search: [inference endpoints](/reference/query-languages/esql/esql-cross-clusters.md#ccq-inference-endpoints) and [relevance scores across clusters](/reference/query-languages/esql/esql-cross-clusters.md#ccq-scores). Inference endpoints for `RERANK`, `COMPLETION`, `TEXT_EMBEDDING`, and `EMBEDDING` must exist in the origin project. Querying a `semantic_text` field needs that field's `search_inference_id` endpoint in every project that holds the data being queried.
 
+{applies_to}`serverless: preview` This also applies to `DENSE_VECTOR`.
+
 ### LOOKUP JOIN across projects
 
 {{esql}} `LOOKUP JOIN` follows the same constraints as [{{esql}} cross-cluster `LOOKUP JOIN`](/reference/query-languages/esql/esql-lookup-join.md#cross-cluster-support). By default, {{esql}} resolves the lookup index on every project in the query and each project joins against its own local index with that name. In this case, the lookup index must exist on every project being queried.
@@ -412,6 +414,17 @@ If the lookup index is missing from one or more linked projects, use [coordinato
 These queries will run in serverless just like a normal {{esql}} query. With some limitations:
 :::{include} _snippets/common/cps_view_limitations.md
 :::
+
+### Federated datasets across projects
+
+```{applies_to}
+serverless: preview
+```
+
+[Federated datasets](/reference/query-languages/esql/esql-data-federation-datasets.md) resolve only in the origin project:
+
+* Datasets in linked projects are invisible to the query, including through qualified expressions such as `FROM linked-project:dataset`.
+* An unqualified expression that matches a dataset in the origin project also matches indices with the same name in linked projects. CPS returns results from both.
 
 
 ## Related pages

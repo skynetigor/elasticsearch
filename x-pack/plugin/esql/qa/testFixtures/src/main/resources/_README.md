@@ -223,6 +223,36 @@ null
 ;
 ```
 
+### Approximate knn
+
+`knn` uses approximate nearest-neighbour search (HNSW) when pushed to Lucene.
+`LIMIT` after `knn` is pushed into the function as `k`. The result is a
+top-k **set**, not a unique ranked table: approximation may omit a true
+neighbour, and equal scores at the `k` cut pick an arbitrary document.
+
+Do **not** assert an exact top-k table (specific colors in specific slots).
+`ignoreOrder` does not help: it only reorders rows, it does not stabilize
+which rows knn kept.
+
+For tests of knn together with other operators (`RENAME`, `MV_EXPAND`,
+`EVAL`, …), pin the result with a filter on a uniquely nearest document:
+
+```csv-spec
+from colors metadata _score
+| rename rgb_vector as vec
+| where knn(vec, [0, 120, 0]) and color == "green"
+| keep color, vec
+;
+
+color:text | vec:dense_vector
+green      | [0.0, 128.0, 0.0]
+;
+```
+
+Asserting `count(*)` or using `{any}` (below) is also fine. Docs snippets
+may show a representative ranking on this tiny fixture; do not copy that
+pattern into new tests.
+
 ### Non-deterministic results: ranges and wildcards
 
 When a result is not exactly predictable (approximate aggregations, similarity
@@ -241,6 +271,34 @@ similarityScore:double | topIds:long
 0.9..1.0               | [100..200, {any}]
 ;
 ```
+
+### Query parameters
+
+Query parameters are declared with the `param:` directive, one per line, in the order they're sent:
+`param: name = <json>` for a named parameter and `param: <json>` for an unnamed one.
+The value is written as in the `params` array of the request, so strings are quoted, and named parameters
+can also be objects like `{"identifier": "first_name"}` or `{"pattern": "*_name"}`.
+As in the request, a test can't mix named and unnamed parameters.
+
+```csv-spec
+doubleParameterMarkers
+required_capability: double_parameter_markers_for_identifiers
+param: field = "last_name"
+param: last = "Koblick"
+FROM employees
+| WHERE ??field == ?last
+| KEEP emp_no, ??field
+;
+
+emp_no:integer | last_name:keyword
+10004          | Koblick
+;
+```
+
+Variants that look for field names in the query text, like `CsvLoadAllUnmappedKeywordIT`, skip tests where a
+parameter can be a field name: a `??` reference, or a parameter declared as an identifier or pattern.
+The cross-cluster tests skip tests that use parameters in the source command, like `PROMQL index=?idx ...`,
+and `CsvColumnarIT` and the exemplars smoke tests skip tests that take the `PROMQL` index from a parameter.
 
 ### Query pragmas
 

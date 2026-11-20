@@ -26,8 +26,9 @@ public class KibanaSecurityPlugin extends Plugin implements SecurityExtension {
     private static final List<ImplicitPrivilegesProvider> PROVIDERS = List.of(
         new KibanaAlertsImplicitPrivilegesProvider(),
         new KibanaCasesImplicitPrivilegesProvider(),
-        new ElasticAiIndexImplicitPrivilegesProvider(),
-        new KibanaWorkflowsImplicitPrivilegesProvider()
+        new KibanaWorkflowsImplicitPrivilegesProvider(),
+        new KibanaNightshiftImplicitPrivilegesProvider(),
+        new ElasticAiIndexImplicitPrivilegesProvider()
     );
 
     @Override
